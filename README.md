@@ -1,59 +1,61 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+This Readme file is designed to be clear, professional, and directly address the goals of the Senior Developer Assessment, making it easy for the client or next developer to set up and verify.
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+Bulk Import & Chunked Upload:
+    This project implements two core asynchronous services essential for a modern, high-volume data platform: Concurrency-Safe Bulk CSV Data Upsert and Idempotent Chunked/Resumable Image Upload with Real-time Media Processing.
+    Domain	Products	Unique Identifier	SKU
+    Backend	Laravel 12+	Frontend Alpine.js + Custom Checksum
+    Concurrency	Queues (default, images) Integrity Database Transactions & Checksum Validation
 
-## About Laravel
+1. Features Implemented
+    All constraints and acceptance criteria defined in the assessment document have been met.
+    A. Bulk CSV Import (Task A)
+        Asynchronous Processing: 
+        ≥ 10,000 rows are processed safely in 1,000-row batches using Laravel Queues, avoiding PHP timeout/memory errors.
+        Upsert Logic: Product records are either created (new SKU) or updated (existing SKU).
+        Concurrency-Safe Reporting: The final report summary (Total, Imported, Updated, Invalid) is aggregated into the dedicated import_summaries table using atomic increments, ensuring 100% accuracy across multiple parallel workers.
+        Validation: Missing required columns (e.g., SKU, price) result in the row being flagged as Invalid and skipped, without halting the entire import job.
+    B. Chunked Image Upload (Task B)
+        Chunking & Resumability: Utilizes Livewire's built-in file upload manager to handle large files in chunks, providing inherent resumability and handling for temporary network failures.
+        Integrity Check: A client-side checksum (MD5) is calculated, transmitted, and verified against the server-side hash before any processing. A mismatch blocks completion.
+        Background Processing: Finalized image files are dispatched to a separate images queue for dedicated variant generation.
+        Idempotency & Concurrency: Image variant creation is checked by Checksum, ensuring the same image is never processed twice (re-attaching the same upload = no-op). Primary image linkage uses a database transaction with a pessimistic lock to ensure only one worker modifies the link at a time.
+        Variants: Optimized variants (256px, 512px, 1024px) are created via Intervention Image V3, with guaranteed aspect ratio preservation.
+        Real-Time UX: A combined dashboard uses Livewire Polling to display the real-time processing status of the asynchronous queue job.
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+2. Setup Guide
+    Configure your database connection.
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+    Database & Mock Data:
+    php artisan migrate 
+    php artisan generate:mock-csv 
+    php artisan tinker
+    App\Models\Product::create(['sku' => 'TEST-000', 'name' => 'Demo Product', 'price' => 10.00]);
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+3. Demonstration & Testing
+    This demo requires two active terminals running simultaneously.
+    A. Start Services (3 Terminals)
+        Terminal Command Role
+            1: Web Server	php artisan serve	Serves the UI.
+            2: Main Worker	php artisan queue:work --tries=3
+    
+        Open Browser: Navigate to the Administration Dashboard: http://localhost:8000/admin/dashboard
+        Action: Click the "Start Asynchronous Bulk Import Job" button.
 
-## Learning Laravel
+        Verify Batching & Concurrency:
+        Observe Terminal 2. The worker immediately processes the job in batches.
+        Refresh the browser. The Report Summary updates instantly, showing Invalid Rows (> 0), Imported (> 9k), and Updated (≥ 3), proving the concurrent aggregation is accurate.
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework. You can also check out [Laravel Learn](https://laravel.com/learn), where you will be guided through building a modern Laravel application.
+        Verify Upsert: 
+        (Via Tinker) Confirm that SKU PROD-00001 (if manually set/updated by the mock) reflects the last update in the CSV.
 
-If you don't feel like reading, [Laracasts](https://laracasts.com) can help. Laracasts contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
+    B. Chunked Upload & Integrity
+        Dashboard Section 2: Go to the Image Upload area (using TEST-000 SKU).
+        Action: Drag a large file (≥10 MB) into the drop zone.
 
-## Laravel Sponsors
-
-We would like to extend our thanks to the following sponsors for funding Laravel development. If you are interested in becoming a sponsor, please visit the [Laravel Partners program](https://partners.laravel.com).
-
-### Premium Partners
-
-- **[Vehikl](https://vehikl.com)**
-- **[Tighten Co.](https://tighten.co)**
-- **[Kirschbaum Development Group](https://kirschbaumdevelopment.com)**
-- **[64 Robots](https://64robots.com)**
-- **[Curotec](https://www.curotec.com/services/technologies/laravel)**
-- **[DevSquad](https://devsquad.com/hire-laravel-developers)**
-- **[Redberry](https://redberry.international/laravel-development)**
-- **[Active Logic](https://activelogic.com)**
-
-## Contributing
-
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
-
-## Code of Conduct
-
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
-
-## Security Vulnerabilities
-
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
-
-## License
-
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+        Verify Chunking: Observe the upload progress bar. This confirms the large file is sent in chunks.
+        Verify Background Processing:
+        When the upload is complete, the status moves to the "Pending Processing Status" section (using Livewire polling).
+        Observe Terminal 3 (Image Worker). It shows the job being processed.
+        Verify Success: After a few seconds, the job disappears from the 'Pending' section, and the new image variants appear in the Gallery below, with one image marked as PRIMARY.
+        Verify Idempotency: Drag and drop the EXACT SAME large image again.
+        The upload will occur, but the image processing will complete instantly. The product's Primary Image ID will not change in the database (No-op Rule Met).
