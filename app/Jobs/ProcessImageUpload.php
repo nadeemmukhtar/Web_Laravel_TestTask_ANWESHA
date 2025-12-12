@@ -2,8 +2,6 @@
 
 namespace App\Jobs;
 
-// use App\Models\Image;
-
 use App\Models\Image;
 use App\Models\Product;
 use App\Models\Upload;
@@ -16,21 +14,21 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Intervention\Image\ImageManager;
 use Intervention\Image\Drivers\Gd\Driver;
-use Intervention\Image\Interfaces\EncoderInterface;
 use Intervention\Image\Encoders\JpegEncoder;
 use RuntimeException;
+use Throwable;
 
 class ProcessImageUpload implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     /**
-     * Create a new job instance.
+     * Job instance properties.
      */
     public function __construct(
-        protected int $uploadId,
-        protected string $clientChecksum,
-        protected string $productSku,
+        protected int $uploadRecordId,
+        protected string $uploadedChecksum,
+        protected string $targetProductSku,
     ) {}
 
     /**
@@ -38,76 +36,85 @@ class ProcessImageUpload implements ShouldQueue
      */
     public function handle(): void
     {
-        $manager = new ImageManager(new Driver());
-        $upload = Upload::findOrFail($this->uploadId);
+        $imageManager = new ImageManager(new Driver());
+        $uploadRecord = Upload::findOrFail($this->uploadRecordId);
 
-        // 1. Checksum Validation (Rule: Checksum mismatch blocks completion)
-        $rawPath = 'uploads/raw/' . $upload->file_name;
+        // 1. Validate checksum integrity
+        $rawImagePath = 'uploads/raw/' . $uploadRecord->file_name;
+        $serverGeneratedChecksum = hash_file(
+            'md5',
+            Storage::disk($uploadRecord->disk)->path($rawImagePath)
+        );
 
-        $serverChecksum = hash_file('md5', Storage::disk($upload->disk)->path($rawPath));
-        if ($serverChecksum !== $this->clientChecksum) {
-            throw new RuntimeException("Checksum mismatch for Upload ID: {$upload->id}. Client: {$this->clientChecksum}, Server: {$serverChecksum}");
+        if ($serverGeneratedChecksum !== $this->uploadedChecksum) {
+            throw new RuntimeException(
+                "Checksum mismatch for Upload ID: {$uploadRecord->id}. " .
+                "Client: {$this->uploadedChecksum}, Server: {$serverGeneratedChecksum}"
+            );
         }
 
-        // Checksum Validation complete. Now, handle Idempotency (Rule: Re-attaching the same upload = no-op)
-        $existingImage = Image::where('checksum', $serverChecksum)->first();
-        if ($existingImage) {
-            $this->linkImageToProduct($existingImage, $this->productSku);
+        // Idempotency check — if image exists, just link it
+        $existingImageRecord = Image::where('checksum', $serverGeneratedChecksum)->first();
+
+        if ($existingImageRecord) {
+            $this->assignImageToProduct($existingImageRecord, $this->targetProductSku);
             return;
         }
 
-        // 2. Image Variant Generation (256px, 512px, 1024px)
-        $variants = [256, 512, 1024];
-        $variantPaths = [];
-        $imageHash = time() . '-' . hash('sha1', $upload->file_name); // Unique name
+        // 2. Generate image variants
+        $variantSizes = [256, 512, 1024];
+        $generatedVariantPaths = [];
+        $uniqueImageName = time() . '-' . hash('sha1', $uploadRecord->file_name);
 
         try {
-            $originalImageContent = Storage::disk($upload->disk)->get($rawPath);
-            $image = $manager->read($originalImageContent);
+            $originalContent = Storage::disk($uploadRecord->disk)->get($rawImagePath);
+            $baseImage = $imageManager->read($originalContent);
 
-            foreach ($variants as $size) {
-                // Rule: Variants must respect aspect ratio (fit)
-                $variantImage = clone $image;
-                $variantImage->resize($size, $size, function ($constraint) {
+            foreach ($variantSizes as $dimension) {
+                $resizedImage = clone $baseImage;
+
+                $resizedImage->resize($dimension, $dimension, function ($constraint) {
                     $constraint->aspectRatio();
-                    $constraint->upsize(); // Only upscale if smaller
+                    $constraint->upsize();
                 });
 
-                $path = "images/variants/{$size}/{$imageHash}.jpg";
-                Storage::disk('public')->put($path, $variantImage->encode(new JpegEncoder(quality: 90)));
-                $variantPaths["{$size}_path"] = $path;
+                $variantPath = "images/variants/{$dimension}/{$uniqueImageName}.jpg";
+                Storage::disk('public')->put(
+                    $variantPath,
+                    $resizedImage->encode(new JpegEncoder(quality: 90))
+                );
+
+                $generatedVariantPaths["{$dimension}_path"] = $variantPath;
             }
 
-            // 3. Store the Image record
-            $imageRecord = Image::create([
-                'upload_id' => $upload->id,
-                'original_path' => $rawPath,
-                '256_path' => $variantPaths['256_path'],
-                '512_path' => $variantPaths['512_path'],
-                '1024_path' => $variantPaths['1024_path'],
-                'checksum' => $serverChecksum,
+            // 3. Store the processed image record
+            $newImageRecord = Image::create([
+                'upload_id'     => $uploadRecord->id,
+                'original_path' => $rawImagePath,
+                '256_path'      => $generatedVariantPaths['256_path'],
+                '512_path'      => $generatedVariantPaths['512_path'],
+                '1024_path'     => $generatedVariantPaths['1024_path'],
+                'checksum'      => $serverGeneratedChecksum,
             ]);
 
-            // 4. Link primary image to the entity
-            $this->linkImageToProduct($imageRecord, $this->productSku);
+            // 4. Attach processed image to product
+            $this->assignImageToProduct($newImageRecord, $this->targetProductSku);
 
-        } catch (\Throwable $e) {
-            // Handle image processing failure
-            throw $e;
-        } finally {
-            // Optional: Clean up the original raw upload if not needed
-            // Storage::disk($upload->disk)->delete($rawPath);
+        } catch (Throwable $error) {
+            throw $error;
         }
     }
 
-    protected function linkImageToProduct(Image $image, string $sku): void
+    /**
+     * Attach image to product safely.
+     */
+    protected function assignImageToProduct(Image $imageRecord, string $sku): void
     {
-        DB::transaction(function () use ($image, $sku) {
-            $product = Product::where('sku', $sku)->firstOrFail();
-            
-            // Concurrency Safe check + Idempotency (Rule: Primary image replacement is idempotent)
-            if ($product->primary_image_id !== $image->id) {
-                $product->update(['primary_image_id' => $image->id]);
+        DB::transaction(function () use ($imageRecord, $sku) {
+            $productRecord = Product::where('sku', $sku)->firstOrFail();
+
+            if ($productRecord->primary_image_id !== $imageRecord->id) {
+                $productRecord->update(['primary_image_id' => $imageRecord->id]);
             }
         });
     }

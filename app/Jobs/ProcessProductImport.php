@@ -18,16 +18,12 @@ class ProcessProductImport implements ShouldQueue
 {
     use Batchable, Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    /**
-     * Create a new job instance.
-     */
-    protected int $batchSize = 1000;
-
-    protected array $requiredCols = ['sku', 'name', 'price', 'description'];
+    protected int $chunkSize = 1000;
+    protected array $mandatoryColumns = ['sku', 'name', 'price', 'description'];
 
     public function __construct(
-        protected string $filePath,
-        protected string $summaryKey
+        protected string $sourceFilePath,
+        protected string $summaryReference
     ) {}
 
     /**
@@ -35,76 +31,84 @@ class ProcessProductImport implements ShouldQueue
      */
     public function handle(): void
     {
-        // The fixed property is now available here:
-        $batchSize = $this->batchSize; // Should be 1000
-        $requiredCols = ['sku', 'name', 'price']; // Or $this->requiredCols
-        $file = Storage::path($this->filePath);
-        $service = new ProductImportService;
+        $chunkSize = $this->chunkSize;
+        $requiredColumns = ['sku', 'name', 'price']; // same behavior as your original
+        $absoluteFilePath = Storage::path($this->sourceFilePath);
 
-        // Data buffers
-        $rowsToUpsert = [];
+        $importService = new ProductImportService;
+        $pendingBatchRows = [];
 
-        // The entire CSV is read once in a stream for low memory usage
         try {
-            $reader = SimpleExcelReader::create($file)->getRows();
+            $csvStream = SimpleExcelReader::create($absoluteFilePath)->getRows();
 
-            $reader->each(function (array $row) use (&$rowsToUpsert, $service, $requiredCols) {
+            $csvStream->each(function (array $row) use (&$pendingBatchRows, $requiredColumns, $importService) {
 
-                // 1. Initial Validation: Check for required columns
-                $missingCols = array_diff($requiredCols, array_keys(array_filter($row)));
+                // 1. Validate required columns
+                $missingColumns = array_diff($requiredColumns, array_keys(array_filter($row)));
 
-                // Validation Rule: Check for required columns, and record invalid count
-                if (! empty($missingCols) || ! isset($row['sku']) || empty($row['sku'])) {
-                    // Rule: Missing columns = invalid rows, but do not stop import.
+                if (!empty($missingColumns) || empty($row['sku'] ?? null)) {
 
-                    // Atomically update global invalid count
+                    // Count invalid row
                     DB::table('import_summaries')
-                        ->where('key', $this->summaryKey)
+                        ->where('key', $this->summaryReference)
                         ->increment('invalid_count');
 
-                    DB::table('import_summaries')->where('key', $this->summaryKey)->increment('total_count');
+                    // Always increment total count
+                    DB::table('import_summaries')
+                        ->where('key', $this->summaryReference)
+                        ->increment('total_count');
 
-                    return; // Skip invalid row
+                    return;
                 }
 
-                // 2. Add row to current batch and increment total count for valid rows
-                $rowsToUpsert[] = $row;
-                DB::table('import_summaries')->where('key', $this->summaryKey)->increment('total_count');
+                // Valid row → add to batch
+                $pendingBatchRows[] = $row;
 
-                // 3. Process the Batch and Dispatch the Work (When limit is hit)
-                if (count($rowsToUpsert) >= $this->batchSize) {
-                    // Dispatch or directly execute (execution is better as it simplifies reporting)
-                    $this->processBatchAndUpdateSummary($service, $rowsToUpsert);
-                    $rowsToUpsert = []; // Reset the batch buffer
+                DB::table('import_summaries')
+                    ->where('key', $this->summaryReference)
+                    ->increment('total_count');
+
+                // 2. When chunk size is reached → process batch
+                if (count($pendingBatchRows) >= $this->chunkSize) {
+                    $this->applyBatchAndUpdateSummary($importService, $pendingBatchRows);
+                    $pendingBatchRows = [];
                 }
             });
 
-            // Process any remaining partial batch
-            if (! empty($rowsToUpsert)) {
-                $this->processBatchAndUpdateSummary($service, $rowsToUpsert);
+            // 3. Final partial batch
+            if (!empty($pendingBatchRows)) {
+                $this->applyBatchAndUpdateSummary($importService, $pendingBatchRows);
             }
 
-            // Mark as completed
-            DB::table('import_summaries')->where('key', $this->summaryKey)->update(['status' => 'completed', 'completed_at' => now()]);
+            // Import completed
+            DB::table('import_summaries')
+                ->where('key', $this->summaryReference)
+                ->update([
+                    'status'       => 'completed',
+                    'completed_at' => now(),
+                ]);
 
-        } catch (Throwable $e) {
-            // Mark as failed and throw to Laravel for failed job handling/retries
-            DB::table('import_summaries')->where('key', $this->summaryKey)->update(['status' => 'failed']);
-            throw $e;
+        } catch (Throwable $exception) {
+            DB::table('import_summaries')
+                ->where('key', $this->summaryReference)
+                ->update(['status' => 'failed']);
+
+            throw $exception;
         }
     }
 
-    // ⭐️ Note: This private method updates the summary table after each 1000-row execution.
-    protected function processBatchAndUpdateSummary(ProductImportService $service, array $batch): void
+    /**
+     * Processes a single batch and updates summary counters.
+     */
+    protected function applyBatchAndUpdateSummary(ProductImportService $importService, array $batchRows): void
     {
-        $batchResult = $service->upsertBatch($batch);
+        $batchStats = $importService->upsertBatch($batchRows);
 
-        // Atomically increment final report counts
         DB::table('import_summaries')
-            ->where('key', $this->summaryKey)
+            ->where('key', $this->summaryReference)
             ->update([
-                'imported_count' => DB::raw("imported_count + {$batchResult['inserted']}"),
-                'updated_count' => DB::raw("updated_count + {$batchResult['updated']}"),
+                'imported_count' => DB::raw("imported_count + {$batchStats['inserted']}"),
+                'updated_count'  => DB::raw("updated_count + {$batchStats['updated']}"),
             ]);
     }
 }

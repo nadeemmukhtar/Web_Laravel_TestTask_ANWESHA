@@ -7,87 +7,62 @@ use Carbon\Carbon;
 
 class ProductImportService
 {
-    public function upsertBatch(array $batch): array
+    public function upsertBatch(array $batchRows): array
     {
-        if (empty($batch)) {
+        if (empty($batchRows)) {
             return ['inserted' => 0, 'updated' => 0, 'duplicates' => 0];
         }
 
-        $now = Carbon::now();
-        $upsertData = [];
+        $currentTimestamp = Carbon::now();
+        $preparedRows = [];
 
-        foreach ($batch as $row) {
-            $upsertData[] = [
-                'sku' => $row['sku'],
-                'name' => $row['name'],
-                'description' => $row['description'],
-                'price' => (float) $row['price'],
-                'created_at' => $now,
-                'updated_at' => $now,
+        foreach ($batchRows as $csvRow) {
+            $preparedRows[] = [
+                'sku'         => $csvRow['sku'],
+                'name'        => $csvRow['name'],
+                'description' => $csvRow['description'],
+                'price'       => (float) $csvRow['price'],
+                'created_at'  => $currentTimestamp,
+                'updated_at'  => $currentTimestamp,
             ];
         }
 
-        // --- Core Upsert Logic ---
-        $affectedRows = DB::table('products')->upsert(
-            $upsertData,
-            ['sku'], // Unique By Key
-            ['name', 'description', 'price', 'updated_at'] // Columns to update on collision
+        // --- Perform UPSERT ---
+        $affectedCount = DB::table('products')->upsert(
+            $preparedRows,
+            ['sku'], // Unique Key
+            ['name', 'description', 'price', 'updated_at']
         );
-        // -------------------------
 
-        // Upsert returns the number of inserted/updated rows combined. 
-        // A Senior-level solution often infers counts.
-        $totalHandled = count($batch);
-        $totalRowsAffected = $affectedRows;
+        $totalRows = count($batchRows);
+        $currentSkus = array_column($preparedRows, 'sku');
 
-        // Since we are checking required columns in the Job, a simplified interpretation 
-        // of affectedRows > totalHandled means more updates than inserts.
-        
-        // Simulating the report: (affectedRows = INSERTED + 2 * UPDATED)
-        // If an update occurs, the row is 'affected' twice (Laravel documentation nuance) 
-        // compared to a new insert.
+        // Count existing before upsert
+        $existingBefore = DB::table('products')
+            ->whereIn('sku', $currentSkus)
+            ->count();
 
-        $insertedCount = $totalRowsAffected % $totalHandled;
-        $updatedCount = floor($totalRowsAffected / $totalHandled) - $insertedCount; 
+        // Count again after upsert
+        $existingAfter = DB::table('products')
+            ->whereIn('sku', $currentSkus)
+            ->count();
 
-        // Simplified for Assessment Clarity (Requires pre-checking for robust tracking)
-        // Since $affectedRows tracks the total operations (1 for INSERT, 2 for UPDATE):
-        $newRecords = 0;
-        $updatedRecords = 0;
+        // How many new rows inserted?
+        $newlyInsertedCount = $existingAfter - $existingBefore;
 
-        // A truly robust solution would pre-fetch all SKUs and compare:
-        // $existingSKUs = DB::table('products')->whereIn('sku', array_column($batch, 'sku'))->pluck('sku');
-        // $newSKUs = array_diff(array_column($batch, 'sku'), $existingSKUs->toArray());
-        
-        // Let's use the DB approach:
-        $currentSKUs = array_column($upsertData, 'sku');
-        $initialCount = DB::table('products')->whereIn('sku', $currentSKUs)->count();
+        // Count how many rows got updated
+        $rowsUpdatedAtTime = DB::table('products')
+            ->whereIn('sku', $currentSkus)
+            ->where('updated_at', $currentTimestamp)
+            ->count();
 
-        // Check if any SKUs are actually new after the upsert (this is the simplest robust check)
-        $finalCount = DB::table('products')->whereIn('sku', $currentSKUs)->count();
-        $newlyInserted = $finalCount - $initialCount; 
-        
-        $totalAttempted = count($batch);
-        $totalValid = $totalAttempted;
-        $duplicates = 0;
-
-        // Note: For *pure* update count: a check like affectedRows - $newlyInserted is more accurate.
-        $totalOps = DB::table('products')
-            ->selectRaw('count(*) as count')
-            ->whereIn('sku', $currentSKUs)
-            ->where('updated_at', $now)
-            ->pluck('count')->first(); 
-            
-        $newRecords = $newlyInserted;
-        $updatedRecords = $totalOps - $newlyInserted;
-
-        // Note: The final result summary in the Job will need a storage location (DB table, Redis key)
-        // to aggregate results from all batches, as multiple jobs update a single total count.
+        $inserted = $newlyInsertedCount;
+        $updated = $rowsUpdatedAtTime - $newlyInsertedCount;
 
         return [
-            'inserted' => $newRecords, 
-            'updated' => $updatedRecords, 
-            'duplicates' => 0, // Since duplicates are being updated, we assume 'updated' is the counter here
+            'inserted'   => $inserted,
+            'updated'    => $updated,
+            'duplicates' => 0,
         ];
     }
 }

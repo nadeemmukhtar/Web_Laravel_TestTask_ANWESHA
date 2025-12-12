@@ -13,19 +13,24 @@ use Illuminate\Support\Facades\Storage;
 class ImportController extends Controller
 {
     /**
-     * Renders the main dashboard with data for the UI components.
+     * Display the dashboard with the latest import information.
      */
     public function index()
     {
-        $latestSummary = DB::table('import_summaries')->latest('id')->first();
-        $productToLink = Product::where('sku', 'TEST-000')->first() ?? Product::latest('id')->first();
-        $csvExists = Storage::exists('mock_import.csv');
+        $latestImportSummary = DB::table('import_summaries')->latest('id')->first();
+        $defaultProduct = Product::where('sku', 'TEST-000')->first() 
+                           ?? Product::latest('id')->first();
+        $isCsvAvailable = Storage::exists('mock_import.csv');
 
-        return view('dashboard', compact('latestSummary', 'productToLink', 'csvExists'));
+        return view('dashboard', [
+            'latestSummary' => $latestImportSummary,
+            'productToLink' => $defaultProduct,
+            'csvExists'     => $isCsvAvailable,
+        ]);
     }
 
     /**
-     * Triggers the asynchronous CSV import job (Action from the UI form).
+     * Start the background CSV import task.
      */
     public function triggerImport(Request $request)
     {
@@ -33,51 +38,58 @@ class ImportController extends Controller
             return back()->with('error', 'Mock CSV file not found. Run artisan command first.');
         }
 
-        $summaryKey = 'import-'.time().'-'.uniqid();
+        $importKey = 'import-' . time() . '-' . uniqid();
 
-        // 1. Create a PENDING summary record
+        // Create pending summary record
         DB::table('import_summaries')->insert([
-            'key' => $summaryKey,
-            'status' => 'pending',
+            'key'         => $importKey,
+            'status'      => 'pending',
             'total_count' => 0,
-            'created_at' => now(),
-            'updated_at' => now(),
+            'created_at'  => now(),
+            'updated_at'  => now(),
         ]);
 
-        // 2. Dispatch the job (async operation)
-        ProcessProductImport::dispatch('mock_import.csv', $summaryKey);
+        // Dispatch async job
+        ProcessProductImport::dispatch('mock_import.csv', $importKey);
 
-        return back()->with('status', 'Product Import Job Dispatched! Summary Key: '.$summaryKey);
+        return back()->with('status', 'Product Import Job Dispatched! Summary Key: ' . $importKey);
     }
 
+    /**
+     * Handle single image upload and trigger image processing job.
+     */
     public function uploadImage(Request $request)
     {
         $request->validate([
-            'file' => 'required|image|max:204800',
-            'checksum' => 'required|string',
+            'file'        => 'required|image|max:204800',
+            'checksum'    => 'required|string',
             'product_sku' => 'required|string',
         ]);
 
-        $uploadedFile = $request->file('file');
-        $filename = time().'-'.$uploadedFile->getClientOriginalName();
+        $imageFile = $request->file('file');
+        $generatedFileName = time() . '-' . $imageFile->getClientOriginalName();
 
-        $filePath = $uploadedFile->storeAs('uploads/raw', $filename, 'public');
+        $storedPath = $imageFile->storeAs('uploads/raw', $generatedFileName, 'public');
 
-        $upload = Upload::create([
-            'file_name' => $filename,
-            'mime_type' => $uploadedFile->getClientMimeType(),
-            'file_size' => $uploadedFile->getSize(),
+        $uploadRecord = Upload::create([
+            'file_name'     => $generatedFileName,
+            'mime_type'     => $imageFile->getClientMimeType(),
+            'file_size'     => $imageFile->getSize(),
             'file_checksum' => $request->input('checksum'),
-            'disk' => 'public',
-            'is_completed' => true,
+            'disk'          => 'public',
+            'is_completed'  => true,
         ]);
 
-        ProcessImageUpload::dispatch($upload->id, $request->input('checksum'), $request->input('product_sku'));
+        ProcessImageUpload::dispatch(
+            $uploadRecord->id,
+            $request->input('checksum'),
+            $request->input('product_sku')
+        );
 
         return response()->json([
-            'success' => true,
-            'upload_id' => $upload->id,
-            'file_name' => $filename,
+            'success'    => true,
+            'upload_id'  => $uploadRecord->id,
+            'file_name'  => $generatedFileName,
         ]);
     }
 }
